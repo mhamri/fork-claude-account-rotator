@@ -1543,7 +1543,7 @@ async function noteModel($: Host, model: string): Promise<boolean> {
 }
 
 /** First run makes the normal login number 1; then: which login this session uses, and Claude in Chrome connected as the extension's account. */
-async function boot($: Host, isInteractive: boolean): Promise<void> {
+async function boot($: Host, isInteractive: boolean, isWindow: boolean): Promise<void> {
   // Terminal.app is the terminal that names itself so and draws block characters from its font.
   const hasFontBlocks = (await $.env.get('TERM_PROGRAM')) === 'Apple_Terminal'
   await setView($, v => ({ ...v, hasFontBlocks }))
@@ -1551,7 +1551,7 @@ async function boot($: Host, isInteractive: boolean): Promise<void> {
   const sessionId = await $.session.id().catch(() => undefined)
   const model = await $.session.model().catch(() => undefined)
   // The mod starts again at every reload of its code, in a session by then at work: only its first start is a window opening.
-  const isOpening = (await getView($)).hasStarted !== true
+  const isOpening = isWindow && (await getView($)).hasStarted !== true
   await mergeStore($)
   await setView($, v => ({ ...v, hasStarted: true, ...(sessionId === undefined ? {} : { sessionId }), ...(model === undefined ? {} : { model }) }))
   await dropOldMoves($)
@@ -1574,7 +1574,7 @@ async function boot($: Host, isInteractive: boolean): Promise<void> {
     : undefined
   const startOn = start !== undefined && start.id !== activeId ? start : undefined
   // First, while the session can still move: the rotation waits for it. Connect's visit ends where the session starts.
-  if (isInteractive && shouldConnectAtOpen(await getView($), await $.clock.now())) {
+  if (isInteractive && isWindow && shouldConnectAtOpen(await getView($), await $.clock.now())) {
     void connectChrome($, true, undefined, startOn).catch(error => debug($, `Chrome connect failed: ${String(error)}`))
   } else if (startOn !== undefined) {
     // A move that fails leaves the session on Claude Code's login, and the checks below their turn.
@@ -1594,7 +1594,7 @@ async function boot($: Host, isInteractive: boolean): Promise<void> {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    void boot($, e.isInteractive).catch(error => debug($, `start failed: ${String(error)}`))
+    void boot($, e.isInteractive, true).catch(error => debug($, `start failed: ${String(error)}`))
     void $.ui.panes().then(panes => {
       isPaneShown = panes.some(p => p.id === PANE && p.isShown)
     })
@@ -1609,6 +1609,13 @@ export const register: Register = on => {
     })
     return started
   })
+
+  // A /clear goes on under a new session id with this session's state gone, and raises no session.start: the footer and band would draw nothing.
+  on('classic.SessionStart', async ($, e, next) => {
+    const started = await next(e)
+    if (e.source === 'clear') void boot($, true, false).catch(error => debug($, `start after /clear failed: ${String(error)}`))
+    return started
+  }).catch(($, e, next) => next(e))
 
   // Claude Code reads the sign-in again just before a request: the profile check is sure of a switch only after one.
   on('turn.step', async function* ($, e, next) {
