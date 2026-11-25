@@ -116,6 +116,9 @@ const blinkAtom = atom({ plugin: 'account-rotator', key: 'blink' } as const, tru
  * below 144 columns. Kept in step with closes by the person and with reloads.
  */
 let isPaneShown = false
+/** The view as a /clear found it, put back in the session that follows: the process, its timers and its sign-in go on. */
+let cleared: View | undefined
+let resuming: Promise<void> | undefined
 /** The `claude auth login` child of the sign-in under way, so Cancel can end it. */
 let running: HookStream<ProcessSpawnChunk, ProcessSpawnResult> | undefined
 /** The login this session is signing in; a stored 'logging-in' from a session that died is checked again. */
@@ -743,6 +746,8 @@ async function refreshingSoon(
  */
 async function switchTo($: Host, target: Account, why: string, options: SwitchOptions = {}): Promise<boolean> {
   const { isQuiet = false, isOpening = false, isPicked = false } = options
+  // Between a /clear's end and its view put back, the view names no account in use: a switch would go by a guess.
+  if (cleared !== undefined) return false
   const turning = await refreshingSoon($, await getView($), target, await $.clock.now(), isOpening)
   if (turning !== undefined) {
     if (held === undefined) {
@@ -1543,7 +1548,7 @@ async function noteModel($: Host, model: string): Promise<boolean> {
 }
 
 /** First run makes the normal login number 1; then: which login this session uses, and Claude in Chrome connected as the extension's account. */
-async function boot($: Host, isInteractive: boolean, isWindow: boolean): Promise<void> {
+async function boot($: Host, isInteractive: boolean): Promise<void> {
   // Terminal.app is the terminal that names itself so and draws block characters from its font.
   const hasFontBlocks = (await $.env.get('TERM_PROGRAM')) === 'Apple_Terminal'
   await setView($, v => ({ ...v, hasFontBlocks }))
@@ -1551,7 +1556,7 @@ async function boot($: Host, isInteractive: boolean, isWindow: boolean): Promise
   const sessionId = await $.session.id().catch(() => undefined)
   const model = await $.session.model().catch(() => undefined)
   // The mod starts again at every reload of its code, in a session by then at work: only its first start is a window opening.
-  const isOpening = isWindow && (await getView($)).hasStarted !== true
+  const isOpening = (await getView($)).hasStarted !== true
   await mergeStore($)
   await setView($, v => ({ ...v, hasStarted: true, ...(sessionId === undefined ? {} : { sessionId }), ...(model === undefined ? {} : { model }) }))
   await dropOldMoves($)
@@ -1574,7 +1579,7 @@ async function boot($: Host, isInteractive: boolean, isWindow: boolean): Promise
     : undefined
   const startOn = start !== undefined && start.id !== activeId ? start : undefined
   // First, while the session can still move: the rotation waits for it. Connect's visit ends where the session starts.
-  if (isInteractive && isWindow && shouldConnectAtOpen(await getView($), await $.clock.now())) {
+  if (isInteractive && shouldConnectAtOpen(await getView($), await $.clock.now())) {
     void connectChrome($, true, undefined, startOn).catch(error => debug($, `Chrome connect failed: ${String(error)}`))
   } else if (startOn !== undefined) {
     // A move that fails leaves the session on Claude Code's login, and the checks below their turn.
@@ -1591,34 +1596,57 @@ async function boot($: Host, isInteractive: boolean, isWindow: boolean): Promise
   }
 }
 
+/** A /clear's new session starts with no state and no session.start: it takes the view on, and starts as a reload does. */
+function resumeAfterClear($: Host): Promise<void> {
+  resuming ??= (async () => {
+    const view = cleared
+    if (view !== undefined) {
+      await setView($, () => ({ ...view, sessionId: undefined }))
+      if (view.pending !== undefined && view.pending.isDue !== true) watchSwitch($, view.pending.since)
+    }
+    cleared = undefined
+    resuming = undefined
+    await boot($, true)
+  })()
+  return resuming
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
-    void boot($, e.isInteractive, true).catch(error => debug($, `start failed: ${String(error)}`))
+    void boot($, e.isInteractive).catch(error => debug($, `start failed: ${String(error)}`))
     void $.ui.panes().then(panes => {
       isPaneShown = panes.some(p => p.id === PANE && p.isShown)
     })
     $.clock.every(60_000, () => {
+      if (cleared !== undefined) return
       void mergeStore($)
         .then(() => settleOnce($, false))
         .then(() => maybeRotate($))
         .catch(error => debug($, `sync failed: ${String(error)}`))
     })
     $.clock.every(10 * 60_000, () => {
+      if (cleared !== undefined) return
       void checkAll($).catch(error => debug($, `check failed: ${String(error)}`))
     })
     return started
   })
 
-  // A /clear goes on under a new session id with this session's state gone, and raises no session.start: the footer and band would draw nothing.
+  // Between a /clear's end and its new session's start the view is empty: the timers wait, and nothing switches on a guess.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') cleared = await getView($)
+    return next(e)
+  })
+
   on('classic.SessionStart', async ($, e, next) => {
     const started = await next(e)
-    if (e.source === 'clear') void boot($, true, false).catch(error => debug($, `start after /clear failed: ${String(error)}`))
+    if (e.source === 'clear') void resumeAfterClear($).catch(error => debug($, `start after /clear failed: ${String(error)}`))
     return started
   }).catch(($, e, next) => next(e))
 
   // Claude Code reads the sign-in again just before a request: the profile check is sure of a switch only after one.
   on('turn.step', async function* ($, e, next) {
+    if (cleared !== undefined) await resumeAfterClear($).catch(error => debug($, `start after /clear failed: ${String(error)}`))
     lastRequestAt = await $.clock.now()
     checks = 0
     // The main loop's model, where no /model told it; a subagent's requests name their own.

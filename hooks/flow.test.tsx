@@ -386,7 +386,7 @@ test('moves to the login with room once the active one passes 90% of its 5-hour 
   await footer.unmount()
 })
 
-test('after a /clear, whose new session starts with no state and no session.start, the footer draws again and the session stays where it was', async ($, on) => {
+for (const resumedBy of ['SessionStart', 'the next request'] as const) test(`after a /clear, whose new session starts with no state and no session.start, the footer draws again by ${resumedBy} and the session stays where it was`, async ($, on) => {
   const w = fresh()
   w.keychain['Claude Code-credentials'] = blob('tok-1')
   w.keychain[await keychainItem(SLOT2)] = blob('tok-2')
@@ -394,10 +394,11 @@ test('after a /clear, whose new session starts with no state and no session.star
   w.usage['tok-2'] = [10, 30]
   const clock = world(on, w, TWO_LOGINS)
   on('classic.SessionStart', () => ({}))
+  on('session.end', (_$, e) => ({ sessionId: e.sessionId }))
   let isCleared = false
   on('state.get', { plugin: 'account-rotator' }, (_$, e, next) => {
     if (!isCleared || e.key !== 'view') return next(e)
-    return Promise.resolve(next(e)).then(stored => ({ value: { ...stored.value, value: undefined } }))
+    return Promise.resolve(next(e)).then(stored => (stored.value === undefined ? stored : { value: { ...stored.value, value: undefined } }))
   })
   on('state.set', { plugin: 'account-rotator' }, (_$, e, next) => {
     if (e.key === 'view') isCleared = false
@@ -405,11 +406,14 @@ test('after a /clear, whose new session starts with no state and no session.star
   })
   await start($, clock)
   expect(w.envSets).toEqual([{ name: 'CLAUDE_SECURESTORAGE_CONFIG_DIR', value: SLOT2 }])
+  await $.session.end({ reason: 'clear', sessionId: 'session-1', resume: { id: 'session-1' } })
   isCleared = true
+  await clock.advance(60_000)
   const cleared = await $.ui.mount({ plugin: 'account-rotator', surface: 'terminal', component: 'SessionMode', props: { modes: [] } })
   expect(await cleared.find(GLYPHS)).toBeUndefined()
   await cleared.unmount()
-  await $.classic.SessionStart({ source: 'clear' })
+  if (resumedBy === 'SessionStart') await $.classic.SessionStart({ source: 'clear' })
+  else await request($, clock)
   await clock.settle()
   const footer = await $.ui.mount({ plugin: 'account-rotator', surface: 'terminal', component: 'SessionMode', props: { modes: [] } })
   expect((await footer.find(GLYPHS))?.text).toBe(' ⣀│⣷│  90% \n ▅│▆│  70% ')
